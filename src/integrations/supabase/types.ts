@@ -812,6 +812,7 @@ export type Database = {
           provider: string
           updated_at: string
           user_id: string
+          vital_last_workout_sync_at: string | null
         }
         Insert: {
           api_key?: string
@@ -821,6 +822,7 @@ export type Database = {
           provider?: string
           updated_at?: string
           user_id: string
+          vital_last_workout_sync_at?: string | null
         }
         Update: {
           api_key?: string
@@ -830,6 +832,7 @@ export type Database = {
           provider?: string
           updated_at?: string
           user_id?: string
+          vital_last_workout_sync_at?: string | null
         }
         Relationships: []
       }

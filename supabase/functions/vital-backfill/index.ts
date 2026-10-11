@@ -8,13 +8,25 @@
  *
  * POST /vital-backfill
  * Headers: Authorization: Bearer <supabase_access_token>
- * Body (optional): { "start_date": "2022-01-01" }
+ * Body (optional): { "start_date": "2022-01-01", "force_full_sync": true, "dry_run": true }
+ *
+ * Admin batch (requires VITAL_BACKFILL_ADMIN_SECRET):
+ * Headers: Authorization: Bearer <SUPABASE_SERVICE_ROLE_KEY>, x-cade-admin-secret: <secret>
+ * Body: { "all_vital_users": true } or { "user_id": "<uuid>", "force_full_sync": true }
  *
  * Response: { ok: true, activities_upserted: number, activities_skipped: number,
  *             workouts_received: number, detail?: string }
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import {
+  getVitalHistoryStartDate,
+  getVitalWorkoutChunkDays,
+  getVitalWorkoutMaxPagesChunked,
+  isVitalBackfillDryRunEnv,
+  resolveVitalIncrementalStartDate,
+  vitalJunctionDelay,
+} from "../_shared/vital-junction-fetch-env.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -45,12 +57,6 @@ function getVitalBaseUrl(): string {
 
 function todayStr(): string {
   return new Date().toISOString().split("T")[0];
-}
-
-function twoYearsAgo(): string {
-  const d = new Date();
-  d.setFullYear(d.getFullYear() - 2);
-  return d.toISOString().split("T")[0];
 }
 
 // ─── Type helpers ──────────────────────────────────────────────────────────────
@@ -321,8 +327,9 @@ interface DateWindow {
 async function fetchPagedWorkouts(
   endpoint: string,
   headers: Record<string, string>,
-  maxPages = 50,
+  maxOverrides?: number,
 ): Promise<{ workouts: Dict[]; pages: number; ok: boolean; status: number; detail?: string }> {
+  const maxPages = maxOverrides ?? getVitalWorkoutMaxPagesChunked();
   const workouts: Dict[] = [];
   let pages = 0;
   let cursor: string | null = null;
@@ -346,6 +353,7 @@ async function fetchPagedWorkouts(
       return { workouts, pages, ok: true, status: res.status };
     }
     cursor = next;
+    await vitalJunctionDelay();
   }
 
   return {
@@ -415,86 +423,56 @@ function workoutScore(workout: Dict): number {
   return score;
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
-
-Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+function resolveBackfillStartDate(params: {
+  bodyStart: string | undefined;
+  forceFull: boolean;
+  lastSyncedAt: string | null;
+  historyFloor: string;
+}): string {
+  if (params.bodyStart && /^\d{4}-\d{2}-\d{2}$/.test(params.bodyStart)) {
+    return params.bodyStart;
   }
+  if (params.forceFull || !params.lastSyncedAt) {
+    return params.historyFloor;
+  }
+  return resolveVitalIncrementalStartDate(params.historyFloor, params.lastSyncedAt);
+}
 
-  const requestId =
-    req.headers.get("x-request-id") ?? crypto.randomUUID();
+interface VitalBackfillCoreResult {
+  ok: boolean;
+  activities_upserted: number;
+  activities_skipped: number;
+  workouts_received: number;
+  start_date: string;
+  end_date: string;
+  dry_run: boolean;
+  error?: string;
+  detail?: string;
+}
 
-  try {
-    // Auth
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return json({ error: "Missing Authorization header", request_id: requestId }, 401);
-    }
-
-    const apiKey = Deno.env.get("VITAL_API_KEY");
-    if (!apiKey) {
-      return json({ error: "Vital API key not configured", request_id: requestId }, 500);
-    }
-
-    const userClient = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_ANON_KEY")!,
-      { global: { headers: { Authorization: authHeader } } },
-    );
-    const {
-      data: { user },
-      error: userError,
-    } = await userClient.auth.getUser(
-      authHeader.replace("Bearer ", "").trim(),
-    );
-    if (userError || !user) {
-      return json({ error: "Unauthorized", request_id: requestId }, 401);
-    }
-
-    const supabaseAdmin = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    );
-
-    // Resolve Vital user ID
-    const { data: integration } = await supabaseAdmin
-      .from("integrations")
-      .select("athlete_id")
-      .eq("user_id", user.id)
-      .eq("provider", "vital")
-      .maybeSingle();
-
-    if (!integration?.athlete_id) {
-      return json({ error: "Vital not connected", request_id: requestId }, 404);
-    }
-
-    const vitalUserId = String(integration.athlete_id);
+async function runVitalWorkoutBackfillCore(params: {
+  supabaseAdmin: ReturnType<typeof createClient>;
+  userId: string;
+  vitalUserId: string;
+  startDate: string;
+  requestId: string;
+  dryRun: boolean;
+}): Promise<VitalBackfillCoreResult> {
+  const { supabaseAdmin, userId, vitalUserId, startDate, requestId, dryRun } = params;
+  const endDate = todayStr();
+  const apiKey = Deno.env.get("VITAL_API_KEY")!;
     const baseUrl = getVitalBaseUrl();
     const headers = { "x-vital-api-key": apiKey, Accept: "application/json" };
 
-    // Parse optional start_date from body
-    let startDate = twoYearsAgo();
-    try {
-      const body = (await req.json()) as { start_date?: string };
-      if (body?.start_date && /^\d{4}-\d{2}-\d{2}$/.test(body.start_date)) {
-        startDate = body.start_date;
-      }
-    } catch {
-      // No body or invalid JSON — use default
-    }
-    const endDate = todayStr();
-
     console.log("[vital-backfill] starting backfill", {
-      user_id: user.id,
+    user_id: userId,
       vital_user_id: vitalUserId,
       start_date: startDate,
       end_date: endDate,
+    dry_run: dryRun,
       request_id: requestId,
     });
 
-    // ── Step 1: Probe to find a working endpoint ──────────────────────────────
-    // Use a short 90-day probe window to quickly identify which endpoint responds
     const probeStart = (() => {
       const d = new Date();
       d.setDate(d.getDate() - 90);
@@ -518,46 +496,63 @@ Deno.serve(async (req) => {
         successfulBases.push({ base, count: result.workouts.length });
         console.log("[vital-backfill] probe ok", { base, count: result.workouts.length });
       } else {
-        const unsupported = [400, 404, 405, 410, 422].includes(result.status);
-        console.log("[vital-backfill] probe failed", { base, status: result.status, unsupported });
-      }
+      console.log("[vital-backfill] probe failed", {
+        base,
+        status: result.status,
+        unsupported: [400, 404, 405, 410, 422].includes(result.status),
+      });
+    }
+    await vitalJunctionDelay();
     }
 
     if (successfulBases.length === 0) {
-      return json({
+    return {
         ok: false,
         error: "No Vital workout endpoint responded successfully",
         detail: "Make sure your device is synced in Vital and try again.",
-        request_id: requestId,
         activities_upserted: 0,
         activities_skipped: 0,
         workouts_received: 0,
-      }, 502);
+      start_date: startDate,
+      end_date: endDate,
+      dry_run: dryRun,
+    };
     }
 
-    // Use the top 2 bases by probe count to cover different data shapes
     const topBases = successfulBases
       .sort((a, b) => b.count - a.count)
       .slice(0, 2)
       .map((x) => x.base);
 
-    // ── Step 2: Full chunked fetch over the requested date range ──────────────
-    const windows = buildDateWindows(startDate, endDate, 120); // 120-day chunks
+  const windows = buildDateWindows(startDate, endDate, getVitalWorkoutChunkDays());
+  const chunkMaxPages = getVitalWorkoutMaxPagesChunked();
     const workoutsByKey = new Map<string, Dict>();
 
     for (const base of topBases) {
       for (const window of windows) {
         const endpoint = `${base}?start_date=${window.start}&end_date=${window.end}`;
-        const result = await fetchPagedWorkouts(endpoint, headers, 50);
+      const result = await fetchPagedWorkouts(endpoint, headers, chunkMaxPages);
 
         if (!result.ok) {
           console.warn("[vital-backfill] window fetch failed", {
             base,
             window,
             status: result.status,
+          detail: result.detail,
           });
+        await vitalJunctionDelay();
           continue;
         }
+
+      if (result.detail?.startsWith("Stopped at")) {
+        console.warn("[vital-backfill] window pagination cap", {
+          base,
+          window,
+          pages: result.pages,
+          workouts: result.workouts.length,
+          detail: result.detail,
+        });
+      }
 
         for (const workout of result.workouts) {
           const key = stableWorkoutKey(workout);
@@ -567,6 +562,7 @@ Deno.serve(async (req) => {
             workoutsByKey.set(key, workout);
           }
         }
+      await vitalJunctionDelay();
       }
     }
 
@@ -576,9 +572,24 @@ Deno.serve(async (req) => {
       bases: topBases,
     });
 
-    // ── Step 3: Upsert into activity table ────────────────────────────────────
     let activitiesUpserted = 0;
     let activitiesSkipped = 0;
+
+  if (dryRun) {
+    console.log("[vital-backfill] DRY_RUN: skipping activity upserts", {
+      workouts_received: allWorkouts.length,
+    });
+    return {
+      ok: true,
+      activities_upserted: 0,
+      activities_skipped: 0,
+      workouts_received: allWorkouts.length,
+      start_date: startDate,
+      end_date: endDate,
+      dry_run: true,
+      detail: "DRY_RUN: no rows written",
+    };
+  }
 
     for (const w of allWorkouts) {
       const data = asDict(w.data) ?? w;
@@ -620,7 +631,7 @@ Deno.serve(async (req) => {
 
       const { error } = await supabaseAdmin.from("activity").upsert(
         {
-          user_id: user.id,
+        user_id: userId,
           date: parsedDate.date,
           type: activityType,
           name: firstString(data.name, data.title, w.name, w.title),
@@ -653,19 +664,295 @@ Deno.serve(async (req) => {
       }
     }
 
+  const { error: markErr } = await supabaseAdmin
+    .from("integrations")
+    .update({ vital_last_workout_sync_at: new Date().toISOString() })
+    .eq("user_id", userId)
+    .eq("provider", "vital");
+  if (markErr) {
+    console.warn("[vital-backfill] vital_last_workout_sync_at update failed", markErr.message);
+  }
+
     console.log("[vital-backfill] done", {
       activities_upserted: activitiesUpserted,
       activities_skipped: activitiesSkipped,
       workouts_received: allWorkouts.length,
     });
 
-    return json({
+  return {
       ok: true,
       activities_upserted: activitiesUpserted,
       activities_skipped: activitiesSkipped,
       workouts_received: allWorkouts.length,
       start_date: startDate,
       end_date: endDate,
+    dry_run: false,
+  };
+}
+
+function parseBackfillBody(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {};
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  const requestId =
+    req.headers.get("x-request-id") ?? crypto.randomUUID();
+
+  try {
+    const rawBody = req.method === "POST" ? await req.text().catch(() => "") : "";
+    const body = parseBackfillBody(rawBody);
+
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) {
+      return json({ error: "Missing Authorization header", request_id: requestId }, 401);
+    }
+
+    const apiKey = Deno.env.get("VITAL_API_KEY");
+    if (!apiKey) {
+      return json({ error: "Vital API key not configured", request_id: requestId }, 500);
+    }
+
+    const token = authHeader.replace("Bearer ", "").trim();
+    const serviceRole = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    const adminSecretConfigured = Deno.env.get("VITAL_BACKFILL_ADMIN_SECRET") ?? "";
+    const adminHeader = req.headers.get("x-cade-admin-secret") ?? "";
+    const isAdminRequest =
+      adminSecretConfigured !== "" &&
+      token === serviceRole &&
+      adminHeader === adminSecretConfigured;
+
+    const supabaseAdmin = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    );
+
+    const historyFloor = getVitalHistoryStartDate();
+    const dryRun =
+      isVitalBackfillDryRunEnv() || body.dry_run === true || body.dry_run === "true";
+    const bodyStart = typeof body.start_date === "string" ? body.start_date : undefined;
+    const forceFull =
+      body.force_full_sync === true || body.force_full_sync === "true";
+
+    if (isAdminRequest) {
+      const allVitalUsers =
+        body.all_vital_users === true || body.all_vital_users === "true";
+      const targetUserId = typeof body.user_id === "string" ? body.user_id : undefined;
+
+      if (allVitalUsers) {
+        const { data: rows, error: listErr } = await supabaseAdmin
+          .from("integrations")
+          .select("user_id, athlete_id, vital_last_workout_sync_at")
+          .eq("provider", "vital")
+          .neq("athlete_id", "");
+
+        if (listErr) {
+          return json({ error: listErr.message, request_id: requestId }, 500);
+        }
+
+        const results: Array<
+          Record<string, unknown> & { user_id: string; ok: boolean }
+        > = [];
+
+        for (const row of rows ?? []) {
+          const uid = row.user_id as string;
+          const aid = row.athlete_id as string;
+          if (!aid?.trim()) continue;
+
+          const lastSync = row.vital_last_workout_sync_at != null
+            ? String(row.vital_last_workout_sync_at)
+            : null;
+          const startDate = resolveBackfillStartDate({
+            bodyStart,
+            forceFull,
+            lastSyncedAt: lastSync,
+            historyFloor,
+          });
+
+          try {
+            const core = await runVitalWorkoutBackfillCore({
+              supabaseAdmin,
+              userId: uid,
+              vitalUserId: aid,
+              startDate,
+              requestId,
+              dryRun,
+            });
+            results.push({
+              user_id: uid,
+              ok: core.ok,
+              activities_upserted: core.activities_upserted,
+              activities_skipped: core.activities_skipped,
+              workouts_received: core.workouts_received,
+              start_date: core.start_date,
+              end_date: core.end_date,
+              dry_run: core.dry_run,
+              error: core.error,
+              detail: core.detail,
+            });
+          } catch (e) {
+            console.error("[vital-backfill] batch user failed", uid, e);
+            results.push({
+              user_id: uid,
+              ok: false,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+
+        return json({
+          ok: true,
+          batch: true,
+          users_processed: results.length,
+          results,
+          request_id: requestId,
+        });
+      }
+
+      if (!targetUserId) {
+        return json({
+          error: "Admin backfill requires all_vital_users: true or user_id",
+          request_id: requestId,
+        }, 400);
+      }
+
+      const { data: integ, error: integErr } = await supabaseAdmin
+        .from("integrations")
+        .select("athlete_id, vital_last_workout_sync_at")
+        .eq("user_id", targetUserId)
+        .eq("provider", "vital")
+        .maybeSingle();
+
+      if (integErr) {
+        return json({ error: integErr.message, request_id: requestId }, 500);
+      }
+      if (!integ?.athlete_id) {
+        return json({ error: "Vital not connected for user", request_id: requestId }, 404);
+      }
+
+      const lastSync = integ.vital_last_workout_sync_at != null
+        ? String(integ.vital_last_workout_sync_at)
+        : null;
+      const startDate = resolveBackfillStartDate({
+        bodyStart,
+        forceFull,
+        lastSyncedAt: lastSync,
+        historyFloor,
+      });
+
+      const core = await runVitalWorkoutBackfillCore({
+        supabaseAdmin,
+        userId: targetUserId,
+        vitalUserId: String(integ.athlete_id),
+        startDate,
+        requestId,
+        dryRun,
+      });
+
+      if (!core.ok) {
+        return json({
+          ok: false,
+          error: core.error,
+          detail: core.detail,
+          activities_upserted: core.activities_upserted,
+          activities_skipped: core.activities_skipped,
+          workouts_received: core.workouts_received,
+          request_id: requestId,
+        }, 502);
+      }
+
+      return json({
+        ok: true,
+        admin: true,
+        activities_upserted: core.activities_upserted,
+        activities_skipped: core.activities_skipped,
+        workouts_received: core.workouts_received,
+        start_date: core.start_date,
+        end_date: core.end_date,
+        dry_run: core.dry_run,
+        detail: core.detail,
+        request_id: requestId,
+      });
+    }
+
+    const userClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } },
+    );
+    const {
+      data: { user },
+      error: userError,
+    } = await userClient.auth.getUser(token);
+    if (userError || !user) {
+      return json({ error: "Unauthorized", request_id: requestId }, 401);
+    }
+
+    const { data: integration, error: integrationError } = await supabaseAdmin
+      .from("integrations")
+      .select("athlete_id, vital_last_workout_sync_at")
+      .eq("user_id", user.id)
+      .eq("provider", "vital")
+      .maybeSingle();
+
+    if (integrationError) {
+      return json({ error: integrationError.message, request_id: requestId }, 500);
+    }
+
+    if (!integration?.athlete_id) {
+      return json({ error: "Vital not connected", request_id: requestId }, 404);
+    }
+
+    const lastSyncUser = integration.vital_last_workout_sync_at != null
+      ? String(integration.vital_last_workout_sync_at)
+      : null;
+    const startDate = resolveBackfillStartDate({
+      bodyStart,
+      forceFull,
+      lastSyncedAt: lastSyncUser,
+      historyFloor,
+    });
+
+    const core = await runVitalWorkoutBackfillCore({
+      supabaseAdmin,
+      userId: user.id,
+      vitalUserId: String(integration.athlete_id),
+      startDate,
+      requestId,
+      dryRun,
+    });
+
+    if (!core.ok) {
+      return json({
+        ok: false,
+        error: core.error,
+        detail: core.detail,
+        activities_upserted: core.activities_upserted,
+        activities_skipped: core.activities_skipped,
+        workouts_received: core.workouts_received,
+        request_id: requestId,
+      }, 502);
+    }
+
+    return json({
+      ok: true,
+      activities_upserted: core.activities_upserted,
+      activities_skipped: core.activities_skipped,
+      workouts_received: core.workouts_received,
+      start_date: core.start_date,
+      end_date: core.end_date,
+      dry_run: core.dry_run,
+      detail: core.detail,
       request_id: requestId,
     });
   } catch (err) {

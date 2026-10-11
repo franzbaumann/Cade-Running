@@ -291,7 +291,11 @@ export function useVitalIntegration() {
       const res = await fetch(`${baseUrl}/functions/v1/vital-backfill`, {
         method: "POST",
         headers: getFunctionRequestHeaders(accessToken, requestId),
-        body: JSON.stringify(startDate ? { start_date: startDate } : {}),
+        body: JSON.stringify(
+          startDate
+            ? { start_date: startDate, force_full_sync: true }
+            : { force_full_sync: true },
+        ),
       });
 
       const data = await parseJson<{ ok?: boolean; activities_upserted?: number; activities_skipped?: number; workouts_received?: number } & VitalFunctionError>(res);

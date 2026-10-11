@@ -12,6 +12,14 @@ import {
   fetchVitalWorkoutStreamPayload,
   normalizeVitalStreamPayload,
 } from "../_shared/vital-workout-stream.ts";
+import {
+  getVitalHistoryStartDate,
+  getVitalWorkoutChunkDays,
+  getVitalWorkoutMaxPagesChunked,
+  getVitalWorkoutMaxPagesProbe,
+  resolveVitalIncrementalStartDate,
+  vitalJunctionDelay,
+} from "../_shared/vital-junction-fetch-env.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -34,12 +42,6 @@ function getVitalBaseUrl(): string {
 
 function todayStr(): string {
   return new Date().toISOString().split("T")[0];
-}
-
-function fiveYearsAgo(): string {
-  const d = new Date();
-  d.setFullYear(d.getFullYear() - 5);
-  return d.toISOString().split("T")[0];
 }
 
 function daysAgo(days: number): string {
@@ -353,14 +355,14 @@ interface DateWindow {
 async function fetchWorkoutsFromEndpoint(
   endpoint: string,
   headers: Record<string, string>,
+  options?: { maxPages?: number },
 ): Promise<{ workouts: Dict[]; attempt: EndpointAttempt; ok: boolean }> {
+  const maxPages = options?.maxPages ?? getVitalWorkoutMaxPagesProbe();
   const workouts: Dict[] = [];
   let pages = 0;
   let cursor: string | null = null;
-  let attempts = 0;
 
-  while (attempts < 10) {
-    attempts += 1;
+  while (pages < maxPages) {
     pages += 1;
     const url = new URL(endpoint);
     if (cursor) url.searchParams.set("cursor", cursor);
@@ -397,6 +399,7 @@ async function fetchWorkoutsFromEndpoint(
       };
     }
     cursor = next;
+    await vitalJunctionDelay();
   }
 
   return {
@@ -407,7 +410,7 @@ async function fetchWorkoutsFromEndpoint(
       status: 200,
       pages,
       received: workouts.length,
-      detail: "Stopped pagination at 10 pages limit",
+      detail: `Stopped pagination at ${maxPages} pages limit`,
     },
   };
 }
@@ -444,18 +447,27 @@ async function fetchWorkoutsChunked(
   const workoutsById = new Map<string, Dict>();
   let successfulWindows = 0;
   let partialError: string | undefined;
+  const chunkMaxPages = getVitalWorkoutMaxPagesChunked();
 
   for (const window of windows) {
     const endpoint = `${endpointBase}?start_date=${window.start}&end_date=${window.end}`;
-    const fetched = await fetchWorkoutsFromEndpoint(endpoint, headers);
+    const fetched = await fetchWorkoutsFromEndpoint(endpoint, headers, { maxPages: chunkMaxPages });
     attempts.push(fetched.attempt);
 
     if (!fetched.ok) {
+      console.warn("[vital-sync] chunk window failed", {
+        endpointBase,
+        window,
+        status: fetched.attempt.status,
+        detail: fetched.attempt.detail,
+        pages: fetched.attempt.pages,
+      });
       const unsupported = [400, 404, 405, 410, 422].includes(fetched.attempt.status);
       if (unsupported && successfulWindows === 0) {
         return { workouts: [], attempts, ok: false, partialError: fetched.attempt.detail };
       }
       partialError = `Some date windows failed (${fetched.attempt.status}) while backfilling history.`;
+      await vitalJunctionDelay();
       continue;
     }
 
@@ -476,6 +488,7 @@ async function fetchWorkoutsChunked(
       if (!key) continue;
       workoutsById.set(key, workout);
     }
+    await vitalJunctionDelay();
   }
 
   if (successfulWindows === 0) {
@@ -749,7 +762,7 @@ Deno.serve(async (req) => {
 
     const { data: integration } = await supabaseAdmin
       .from("integrations")
-      .select("athlete_id")
+      .select("athlete_id, vital_last_workout_sync_at")
       .eq("user_id", user.id)
       .eq("provider", "vital")
       .maybeSingle();
@@ -760,11 +773,22 @@ Deno.serve(async (req) => {
     const baseUrl = getVitalBaseUrl();
     const headers = { "x-vital-api-key": apiKey, Accept: "application/json" };
 
-    const startDate = fiveYearsAgo();
+    const historyFloor = getVitalHistoryStartDate();
+    const workoutHistoryStart = resolveVitalIncrementalStartDate(
+      historyFloor,
+      integration.vital_last_workout_sync_at != null
+        ? String(integration.vital_last_workout_sync_at)
+        : null,
+    );
+    const wellnessRangeStart = historyFloor;
     const endDate = todayStr();
     const oneYearStartDate = daysAgo(365);
     const ninetyDaysStartDate = daysAgo(90);
-    const historyWindows = buildDateWindows(startDate, endDate, 120);
+    const historyWindows = buildDateWindows(
+      workoutHistoryStart,
+      endDate,
+      getVitalWorkoutChunkDays(),
+    );
 
     let activitiesUpserted = 0;
     let activitiesSkipped = 0;
@@ -836,7 +860,9 @@ Deno.serve(async (req) => {
     };
 
     for (const endpoint of workoutEndpoints) {
-      const fetched = await fetchWorkoutsFromEndpoint(endpoint, headers);
+      const fetched = await fetchWorkoutsFromEndpoint(endpoint, headers, {
+        maxPages: getVitalWorkoutMaxPagesProbe(),
+      });
       workoutAttempts.push(fetched.attempt);
       workoutsFetchStatus = fetched.attempt.status;
       if (fetched.ok && fetched.workouts.length > 0) {
@@ -851,6 +877,7 @@ Deno.serve(async (req) => {
       if (fetched.ok && fetched.workouts.length === 0 && selectedEndpoint == null) {
         selectedEndpoint = endpoint;
       }
+      await vitalJunctionDelay();
     }
 
     // Backfill full history for all successful endpoint bases (limited to top 3).
@@ -1010,6 +1037,15 @@ Deno.serve(async (req) => {
       }
     }
 
+    const { error: vitalSyncAtErr } = await supabaseAdmin
+      .from("integrations")
+      .update({ vital_last_workout_sync_at: new Date().toISOString() })
+      .eq("user_id", user.id)
+      .eq("provider", "vital");
+    if (vitalSyncAtErr) {
+      console.warn("[vital-sync] vital_last_workout_sync_at update failed", vitalSyncAtErr.message);
+    }
+
     // ─── Workout streams (Junction timeseries) → activity_streams + derived metrics / splits ───
     const STREAM_BATCH_SIZE = 5;
     const STREAM_SYNC_MAX = Math.min(
@@ -1160,7 +1196,7 @@ Deno.serve(async (req) => {
 
     let hrvFetchStatus = 0;
     const hrvRes = await fetch(
-      `${baseUrl}/v2/timeseries/${vitalUserId}/hrv/grouped?start_date=${startDate}&end_date=${endDate}`,
+      `${baseUrl}/v2/timeseries/${vitalUserId}/hrv/grouped?start_date=${wellnessRangeStart}&end_date=${endDate}`,
       { headers }
     );
     hrvFetchStatus = hrvRes.status;
@@ -1192,7 +1228,7 @@ Deno.serve(async (req) => {
 
     let sleepFetchStatus = 0;
     const sleepRes = await fetch(
-      `${baseUrl}/v2/summary/sleep/${vitalUserId}?start_date=${startDate}&end_date=${endDate}`,
+      `${baseUrl}/v2/summary/sleep/${vitalUserId}?start_date=${wellnessRangeStart}&end_date=${endDate}`,
       { headers }
     );
     sleepFetchStatus = sleepRes.status;
@@ -1220,8 +1256,8 @@ Deno.serve(async (req) => {
 
     // ─── Resting HR (Vital timeseries) ────────────────────────────────────────
     const restingHrEndpoints = [
-      `${baseUrl}/v2/timeseries/${vitalUserId}/resting_heart_rate/grouped?start_date=${startDate}&end_date=${endDate}`,
-      `${baseUrl}/v2/timeseries/${vitalUserId}/heartrate/grouped?start_date=${startDate}&end_date=${endDate}`,
+      `${baseUrl}/v2/timeseries/${vitalUserId}/resting_heart_rate/grouped?start_date=${wellnessRangeStart}&end_date=${endDate}`,
+      `${baseUrl}/v2/timeseries/${vitalUserId}/heartrate/grouped?start_date=${wellnessRangeStart}&end_date=${endDate}`,
     ];
     for (const endpoint of restingHrEndpoints) {
       try {
@@ -1265,7 +1301,7 @@ Deno.serve(async (req) => {
     // ─── VO2max (Vital timeseries) ─────────────────────────────────────────────
     try {
       const vo2Res = await fetch(
-        `${baseUrl}/v2/timeseries/${vitalUserId}/vo2_max/grouped?start_date=${startDate}&end_date=${endDate}`,
+        `${baseUrl}/v2/timeseries/${vitalUserId}/vo2_max/grouped?start_date=${wellnessRangeStart}&end_date=${endDate}`,
         { headers },
       );
       if (vo2Res.ok) {
