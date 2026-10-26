@@ -553,6 +553,23 @@ export default function Dashboard() {
           </p>
         </div>
 
+        {/* Build-your-plan CTA — shown when user has data but no training plan yet */}
+        {!planProgress && !isSampleData && (
+          <div
+            className="rounded-xl border border-primary/30 bg-primary/5 px-5 py-4 flex items-center justify-between gap-4 cursor-pointer hover:bg-primary/[0.08] transition-colors"
+            onClick={() => navigate("/coach")}
+            role="button"
+          >
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-foreground">You don't have a training plan yet</p>
+              <p className="text-xs text-muted-foreground mt-0.5">Coach Cade will build one around your goal, schedule and fitness data.</p>
+            </div>
+            <Button size="sm" className="shrink-0" onClick={(e) => { e.stopPropagation(); navigate("/coach"); }}>
+              Build plan <ChevronRight className="w-3.5 h-3.5 ml-0.5" />
+            </Button>
+          </div>
+        )}
+
         {/* Readiness Card — clickable to Stats; check-in row when needed */}
         <Link to="/stats" className="block">
           <div className="glass-card p-6 relative hover:border-gray-300 transition-colors cursor-pointer min-h-0 dark:hover:border-muted-foreground/30">

@@ -116,9 +116,11 @@ function WhyItMatters({ children }: { children: React.ReactNode }) {
 function Step1({
   onNext,
   onMarkDone,
+  onGoToSettings,
 }: {
   onNext: () => void;
   onMarkDone: () => void;
+  onGoToSettings: () => void;
 }) {
   return (
     <div className="flex flex-col gap-6">
@@ -140,6 +142,14 @@ function Step1({
         >
           Already have an account? <span className="underline underline-offset-2">Skip to next step →</span>
         </button>
+      </div>
+
+      <div className="rounded-lg border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+        <span className="font-medium text-foreground">Using Strava instead?</span> Connect it in{" "}
+        <button onClick={onGoToSettings} className="underline underline-offset-2 hover:text-foreground transition-colors">
+          Settings
+        </button>{" "}
+        — then come back to build your plan.
       </div>
 
       <WhyItMatters>
@@ -687,14 +697,12 @@ export function IntervalsSetupGuide() {
             <span className="text-xs text-muted-foreground">
               Step {currentStep} of {STEPS.length}
             </span>
-            {(completedSteps.has(4) || hasDataSource) && (
-              <button
-                onClick={() => navigate(hasDataSource ? "/" : "/settings")}
-                className="text-xs text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
-              >
-                {hasDataSource ? "Skip to dashboard" : "Go to settings"}
-              </button>
-            )}
+            <button
+              onClick={() => navigate(hasDataSource ? "/" : "/settings")}
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+            >
+              {hasDataSource ? "Skip to dashboard" : "Using Strava? Go to Settings →"}
+            </button>
           </div>
         </div>
       </header>
@@ -751,6 +759,7 @@ export function IntervalsSetupGuide() {
                 <Step1
                   onNext={goNext}
                   onMarkDone={() => handleMarkStep(1, { intervals_connected: true })}
+                  onGoToSettings={() => navigate("/settings")}
                 />
               )}
               {currentStep === 2 && (
