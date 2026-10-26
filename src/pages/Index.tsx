@@ -521,7 +521,7 @@ export default function Dashboard() {
   const zoneSource = useZoneSource();
   const { weekStats, lastActivity, recoveryMetrics, readiness, readinessRows, weekPlan, next7DaysHasPlannedSessions, todaysWorkout, athlete, athleteProfile, planProgress, isSampleData, activities } = useDashboardData();
   const { isConnected: intervalsConnected } = useIntervalsIntegration();
-  const { syncing, progress: syncProgress, runQuickSync } = useIntervalsSync();
+  const { syncing, progress: syncProgress, runSync, runQuickSync } = useIntervalsSync();
   const { todayLoad } = useDailyLoad();
   const { openCheckIn, currentStreak, longestStreak, hasCheckedInToday } = useDailyCheckIn();
   const isCurrentWeekInPlan = weekStats.isCurrentWeekInPlan && weekStats.plannedKm != null && weekStats.plannedKm > 0;
@@ -530,12 +530,19 @@ export default function Dashboard() {
   const syncDone = !syncing && syncProgress?.done && syncProgress.stage === "done";
   const syncError = !syncing && syncProgress?.stage === "error";
 
-  async function handleQuickSync() {
-    await runQuickSync();
-    if (syncProgress?.stage === "error") {
-      toast.error(syncProgress.detail ?? "Sync failed");
+  const syncStatusLabel = (() => {
+    if (syncing) {
+      const stage = syncProgress?.stage;
+      if (stage === "activities") return `Reading activities${syncProgress?.runsCount ? ` · ${syncProgress.runsCount}` : ""}…`;
+      if (stage === "wellness") return "Syncing wellness & HRV…";
+      if (stage === "intervals" || stage === "pbs") return "Calculating fitness…";
+      if (stage === "quick_sync") return "Syncing…";
+      return "Starting sync…";
     }
-  }
+    if (syncDone) return syncProgress?.runsCount ? `${syncProgress.runsCount} activities synced` : "Synced";
+    if (syncError) return syncProgress?.detail ?? "Sync failed";
+    return null;
+  })();
 
   return (
     <AppLayout>
@@ -566,31 +573,47 @@ export default function Dashboard() {
             </p>
           </div>
           {intervalsConnected && (
-            <Tooltip>
-              <TooltipTrigger asChild>
+            <div className="shrink-0 flex flex-col items-end gap-1 mt-1">
+              <div className="flex items-center gap-1.5">
                 <button
-                  onClick={handleQuickSync}
+                  onClick={() => runQuickSync()}
                   disabled={syncing}
-                  className={`shrink-0 mt-1 w-8 h-8 rounded-lg flex items-center justify-center transition-colors border ${
+                  title="Quick sync — last 30 days"
+                  className={`h-8 px-3 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors border ${
+                    syncError
+                      ? "border-destructive/30 bg-destructive/10 text-destructive"
+                      : "border-border bg-muted/40 text-muted-foreground hover:text-foreground hover:bg-muted/80"
+                  } disabled:opacity-50`}
+                >
+                  <RefreshCw className={`w-3 h-3 ${syncing && syncProgress?.stage === "quick_sync" ? "animate-spin" : ""}`} />
+                  30d
+                </button>
+                <button
+                  onClick={() => runSync()}
+                  disabled={syncing}
+                  title="Full sync — all history"
+                  className={`h-8 px-3 rounded-lg flex items-center gap-1.5 text-xs font-medium transition-colors border ${
                     syncDone
                       ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
                       : syncError
                       ? "border-destructive/30 bg-destructive/10 text-destructive"
                       : "border-border bg-muted/40 text-muted-foreground hover:text-foreground hover:bg-muted/80"
-                  }`}
-                  aria-label="Sync intervals.icu"
+                  } disabled:opacity-50`}
                 >
                   {syncDone ? (
-                    <Check className="w-3.5 h-3.5" />
+                    <Check className="w-3 h-3" />
                   ) : (
-                    <RefreshCw className={`w-3.5 h-3.5 ${syncing ? "animate-spin" : ""}`} />
+                    <RefreshCw className={`w-3 h-3 ${syncing && syncProgress?.stage !== "quick_sync" ? "animate-spin" : ""}`} />
                   )}
+                  Full sync
                 </button>
-              </TooltipTrigger>
-              <TooltipContent side="left">
-                {syncing ? "Syncing…" : syncDone ? `Done — ${syncProgress?.runsCount ?? 0} activities` : syncError ? syncProgress?.detail : "Sync intervals.icu (last 30 days)"}
-              </TooltipContent>
-            </Tooltip>
+              </div>
+              {syncStatusLabel && (
+                <p className={`text-[11px] ${syncError ? "text-destructive" : syncDone ? "text-emerald-500" : "text-muted-foreground"}`}>
+                  {syncStatusLabel}
+                </p>
+              )}
+            </div>
           )}
         </div>
 
