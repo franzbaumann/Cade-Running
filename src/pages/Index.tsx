@@ -8,13 +8,14 @@ import { AppLayout } from "@/components/AppLayout";
 import { useGreeting } from "@/hooks/useGreeting";
 import { useDashboardData } from "@/hooks/useDashboardData";
 import { useIntervalsIntegration } from "@/hooks/useIntervalsIntegration";
+import { useIntervalsSync } from "@/hooks/useIntervalsSync";
 import { useSeason } from "@/hooks/useSeason";
 import { isRunningActivity } from "@/lib/analytics";
 import { predictRaceTime, predictRaceTimeV2, formatRaceTime, calculateZonePaces, findBestEffort } from "@/lib/race-prediction";
 import { useZoneSource } from "@/hooks/useZoneSource";
 import { calculateTaperStart, daysUntil } from "@/lib/season/periodisation";
 import { format, parseISO } from "date-fns";
-import { TrendingDown, Moon, Heart, ChevronRight, ChevronDown, Loader2, Trophy, AlertTriangle, Flame, Brain } from "lucide-react";
+import { TrendingDown, Moon, Heart, ChevronRight, ChevronDown, Loader2, Trophy, AlertTriangle, Flame, Brain, RefreshCw, Check } from "lucide-react";
 import { useDailyLoad } from "@/hooks/useDailyLoad";
 import { useDailyCheckIn } from "@/components/DailyCheckInContext";
 import { supabase } from "@/integrations/supabase/client";
@@ -520,10 +521,21 @@ export default function Dashboard() {
   const zoneSource = useZoneSource();
   const { weekStats, lastActivity, recoveryMetrics, readiness, readinessRows, weekPlan, next7DaysHasPlannedSessions, todaysWorkout, athlete, athleteProfile, planProgress, isSampleData, activities } = useDashboardData();
   const { isConnected: intervalsConnected } = useIntervalsIntegration();
+  const { syncing, progress: syncProgress, runQuickSync } = useIntervalsSync();
   const { todayLoad } = useDailyLoad();
   const { openCheckIn, currentStreak, longestStreak, hasCheckedInToday } = useDailyCheckIn();
   const isCurrentWeekInPlan = weekStats.isCurrentWeekInPlan && weekStats.plannedKm != null && weekStats.plannedKm > 0;
   const progressPct = isCurrentWeekInPlan ? Math.round((weekStats.actualKm / weekStats.plannedKm!) * 100) : 0;
+
+  const syncDone = !syncing && syncProgress?.done && syncProgress.stage === "done";
+  const syncError = !syncing && syncProgress?.stage === "error";
+
+  async function handleQuickSync() {
+    await runQuickSync();
+    if (syncProgress?.stage === "error") {
+      toast.error(syncProgress.detail ?? "Sync failed");
+    }
+  }
 
   return (
     <AppLayout>
@@ -540,17 +552,46 @@ export default function Dashboard() {
           </div>
         )}
         {/* Page header */}
-        <div>
-          <h1 className="page-title text-foreground">{greeting}</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            {planProgress
-              ? planProgress.planNotStarted
-                ? `Your plan starts ${format(parseISO(planProgress.planStartDate), "MMM d")} — ${planProgress.daysUntilStart} day${planProgress.daysUntilStart === 1 ? "" : "s"} to go`
-                : `Week ${planProgress.currentWeek} of ${planProgress.totalWeeks} · ${planProgress.phase.charAt(0).toUpperCase() + planProgress.phase.slice(1)} Phase · ${planProgress.raceType ?? athlete.goalRace.type} in ${planProgress.totalWeeks - planProgress.currentWeek + 1} weeks`
-              : athlete.goalRace.weeksRemaining != null
-                ? `${athlete.goalRace.type} in ${athlete.goalRace.weeksRemaining} weeks`
-                : athlete.goalRace.type}
-          </p>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="page-title text-foreground">{greeting}</h1>
+            <p className="text-sm text-muted-foreground mt-1">
+              {planProgress
+                ? planProgress.planNotStarted
+                  ? `Your plan starts ${format(parseISO(planProgress.planStartDate), "MMM d")} — ${planProgress.daysUntilStart} day${planProgress.daysUntilStart === 1 ? "" : "s"} to go`
+                  : `Week ${planProgress.currentWeek} of ${planProgress.totalWeeks} · ${planProgress.phase.charAt(0).toUpperCase() + planProgress.phase.slice(1)} Phase · ${planProgress.raceType ?? athlete.goalRace.type} in ${planProgress.totalWeeks - planProgress.currentWeek + 1} weeks`
+                : athlete.goalRace.weeksRemaining != null
+                  ? `${athlete.goalRace.type} in ${athlete.goalRace.weeksRemaining} weeks`
+                  : athlete.goalRace.type}
+            </p>
+          </div>
+          {intervalsConnected && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  onClick={handleQuickSync}
+                  disabled={syncing}
+                  className={`shrink-0 mt-1 w-8 h-8 rounded-lg flex items-center justify-center transition-colors border ${
+                    syncDone
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-500"
+                      : syncError
+                      ? "border-destructive/30 bg-destructive/10 text-destructive"
+                      : "border-border bg-muted/40 text-muted-foreground hover:text-foreground hover:bg-muted/80"
+                  }`}
+                  aria-label="Sync intervals.icu"
+                >
+                  {syncDone ? (
+                    <Check className="w-3.5 h-3.5" />
+                  ) : (
+                    <RefreshCw className={`w-3.5 h-3.5 ${syncing ? "animate-spin" : ""}`} />
+                  )}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="left">
+                {syncing ? "Syncing…" : syncDone ? `Done — ${syncProgress?.runsCount ?? 0} activities` : syncError ? syncProgress?.detail : "Sync intervals.icu (last 30 days)"}
+              </TooltipContent>
+            </Tooltip>
+          )}
         </div>
 
         {/* Build-your-plan CTA — shown when user has data but no training plan yet */}
