@@ -2,13 +2,14 @@ import { useMemo } from "react";
 import { AppLayout } from "@/components/AppLayout";
 import { useIntervalsIntegration } from "@/hooks/useIntervalsIntegration";
 import { useMergedActivities } from "@/hooks/useMergedIntervalsData";
-import { Activity, ArrowRight } from "lucide-react";
+import { Activity, ArrowRight, ChevronRight, Heart, Timer, Ruler } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router-dom";
 import { formatDistance } from "@/lib/format";
 import { isNonDistanceActivity } from "@/lib/analytics";
 import { UnifiedCalendar } from "@/components/UnifiedCalendar";
 import { Marquee } from "@/components/ui/marquee";
+import { format, parseISO } from "date-fns";
 
 function formatDuration(sec: number | null): string {
   if (sec == null) return "";
@@ -159,6 +160,8 @@ export default function Activities() {
     );
   }
 
+  const recent = useMemo(() => runs.slice(0, 30), [runs]);
+
   return (
     <AppLayout>
       <div className="animate-fade-in space-y-6">
@@ -166,6 +169,56 @@ export default function Activities() {
 
         <div className="glass-card overflow-hidden w-full">
           <UnifiedCalendar defaultView="activities" />
+        </div>
+
+        {/* Recent activities list */}
+        <div className="space-y-1">
+          <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider px-1 mb-2">
+            Recent activities
+          </h2>
+          <div className="glass-card divide-y divide-border overflow-hidden">
+            {recent.map((r) => (
+              <button
+                key={r.id}
+                onClick={() => navigate(`/activities/${r.id}`)}
+                className="w-full flex items-center gap-3 px-4 py-3 hover:bg-muted/40 transition-colors text-left"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline gap-2">
+                    <span className="text-sm font-medium text-foreground truncate">{r.name}</span>
+                    <span className="text-xs text-muted-foreground shrink-0">
+                      {format(parseISO(r.date), "MMM d")}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3 mt-0.5 text-xs text-muted-foreground">
+                    <span className="shrink-0">{r.type}</span>
+                    {!r.nonDist && r.km >= 0.01 && (
+                      <span className="flex items-center gap-0.5">
+                        <Ruler className="w-3 h-3" />
+                        {formatDistance(r.km)}
+                      </span>
+                    )}
+                    {r.duration && (
+                      <span className="flex items-center gap-0.5">
+                        <Timer className="w-3 h-3" />
+                        {r.duration}
+                      </span>
+                    )}
+                    {r.pace && (
+                      <span>{r.pace}</span>
+                    )}
+                    {r.hr != null && (
+                      <span className="flex items-center gap-0.5">
+                        <Heart className="w-3 h-3" />
+                        {r.hr}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />
+              </button>
+            ))}
+          </div>
         </div>
       </div>
     </AppLayout>

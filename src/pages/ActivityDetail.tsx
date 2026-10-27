@@ -1068,8 +1068,24 @@ export default function ActivityDetail() {
             )}
 
             {!hasGraphs && (
-              <div className="rounded-xl border border-border bg-card p-12 text-center">
+              <div className="rounded-xl border border-border bg-card p-8 text-center space-y-3">
                 <p className="text-sm text-muted-foreground">{chartsEmptyMessage}</p>
+                {!activity?.streamFetchError && id?.startsWith("icu_") && (
+                  <button
+                    onClick={() => queryClient.invalidateQueries({ queryKey: ["activity-detail", id] })}
+                    className="text-xs text-primary hover:underline"
+                  >
+                    Retry loading graphs from intervals.icu
+                  </button>
+                )}
+                {activity?.streamFetchError && id?.startsWith("icu_") && (
+                  <button
+                    onClick={() => queryClient.invalidateQueries({ queryKey: ["activity-detail", id] })}
+                    className="text-xs text-primary hover:underline"
+                  >
+                    Retry
+                  </button>
+                )}
               </div>
             )}
           </div>
